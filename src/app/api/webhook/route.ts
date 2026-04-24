@@ -6,6 +6,15 @@ import { executeTool, ToolContext } from "@/lib/tools";
 import { SYSTEM_PROMPT } from "@/lib/systemPrompt";
 import { routeMessage, RoutingResult } from "@/lib/router";
 
+// Prevent Next.js from caching this route — Meta webhooks must always be
+// handled dynamically. Caching causes 304 responses which break verification.
+export const dynamic = "force-dynamic";
+
+const NO_CACHE_HEADERS = {
+  "Cache-Control": "no-store, no-cache, must-revalidate",
+  Pragma: "no-cache",
+};
+
 // GET — Meta webhook verification
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
@@ -14,10 +23,10 @@ export async function GET(req: NextRequest) {
   const challenge = searchParams.get("hub.challenge");
 
   if (mode === "subscribe" && token === process.env.INSTAGRAM_VERIFY_TOKEN) {
-    return new NextResponse(challenge, { status: 200 });
+    return new NextResponse(challenge, { status: 200, headers: NO_CACHE_HEADERS });
   }
 
-  return new NextResponse("Forbidden", { status: 403 });
+  return new NextResponse("Forbidden", { status: 403, headers: NO_CACHE_HEADERS });
 }
 
 type ExtractedToolCall = {
@@ -282,5 +291,5 @@ export async function POST(req: NextRequest) {
   // Fire-and-forget so we return 200 immediately to Meta
   processMessage().catch((err) => console.error("[webhook] processing error:", err));
 
-  return new NextResponse("OK", { status: 200 });
+  return new NextResponse("OK", { status: 200, headers: NO_CACHE_HEADERS });
 }
