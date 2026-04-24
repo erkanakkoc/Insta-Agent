@@ -98,17 +98,15 @@ function extractToolCall(text: string): ExtractedToolCall | null {
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
-// Inject routing strategy into system prompt so AI knows the goal for this message
+// Inject routing strategy into system prompt — only for HIGH intent to guide conversion.
+// LOW/MEDIUM rely solely on the system prompt to avoid overriding conversation context.
 function buildSystemPrompt(routing: RoutingResult | null): string {
-  if (!routing) return SYSTEM_PROMPT;
+  if (!routing || routing.intent !== "high") return SYSTEM_PROMPT;
 
   const strategyBlock = `
 
-## CURRENT MESSAGE STRATEGY (follow this for your response)
-Intent level: ${routing.intent.toUpperCase()}
-Goal: ${routing.strategy.goal}
-Tone: ${routing.strategy.tone}
-Instructions: ${routing.strategy.instructions}`;
+## MEVCUT MESAJ STRATEJİSİ
+Kullanıcı satın almaya hazır. Hedef: formu gönder ve randevu al. Sürtünmeyi azalt.`;
 
   return SYSTEM_PROMPT + strategyBlock;
 }
