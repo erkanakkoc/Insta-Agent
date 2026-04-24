@@ -3,11 +3,9 @@ import { createServerSupabaseClient } from "@/lib/supabase";
 import { fetchInstagramProfile, sendInstagramMessage } from "@/lib/instagram";
 import { getAIResponse, callWithModel } from "@/lib/ai";
 import { executeTool, ToolContext } from "@/lib/tools";
-import { SYSTEM_PROMPT } from "@/lib/systemPrompt";
+import { SYSTEM_PROMPT_TEMPLATE } from "@/lib/systemPrompt";
 import { routeMessage, RoutingResult } from "@/lib/router";
 
-// Prevent Next.js from caching this route — Meta webhooks must always be
-// handled dynamically. Caching causes 304 responses which break verification.
 export const dynamic = "force-dynamic";
 
 const NO_CACHE_HEADERS = {
@@ -90,97 +88,26 @@ function extractToolCall(text: string): ExtractedToolCall | null {
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type HistoryMessage = { role: string; content: string };
 
-// --- Conversation state machine ---
-// Instead of asking the AI to figure out what's been discussed, we extract the
-// state ourselves from message history and inject exact instructions so that
-// even small/free models can't accidentally restart the flow.
+// Fill the prompt template with inline conversation history and current message.
+// Embedding history as text (rather than separate chat turns) ensures even
+// small/free models see the full context in one shot.
+function buildPrompt(history: HistoryMessage[], currentMessage: string): string {
+  // history already includes the current user message as the last entry
+  // (it was inserted before the history fetch). Exclude it from {{HISTORY}}.
+  const previous = history.slice(0, -1);
 
-type ConversationState = {
-  lesson_type: "ice" | "roller" | null;
-  location: "bostanli" | "goztepe" | null;
-  lesson_format: "individual" | "group" | null;
-};
+  const historyStr =
+    previous.length === 0
+      ? "(No previous messages — this is the first message)"
+      : previous
+          .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+          .join("\n");
 
-function extractConversationState(history: HistoryMessage[]): ConversationState {
-  // Only look at user messages — assistant messages may echo back words
-  const userText = history
-    .filter((m) => m.role === "user")
-    .map((m) => m.content.toLowerCase())
-    .join(" ");
-
-  return {
-    lesson_type:
-      /tekerlekli|roller/.test(userText)
-        ? "roller"
-        : /buz\s*paten|buz\s*kaym|ice\s*skat/.test(userText)
-        ? "ice"
-        : null,
-    location:
-      /bostanl/.test(userText)
-        ? "bostanli"
-        : /g[oö]ztepe|sahil/.test(userText)
-        ? "goztepe"
-        : null,
-    lesson_format:
-      /birebir|bireysel|[oö]zel/.test(userText)
-        ? "individual"
-        : /grup|group/.test(userText)
-        ? "group"
-        : null,
-  };
+  return SYSTEM_PROMPT_TEMPLATE
+    .replace("{{HISTORY}}", historyStr)
+    .replace("{{MESSAGE}}", currentMessage);
 }
 
-function getNextStep(state: ConversationState): string {
-  if (!state.lesson_type)
-    return 'Kullanıcıya şunu sor: "Buz pateni mi tekerlekli paten mi düşünüyorsun?"';
-  if (state.lesson_type === "ice")
-    return "Buz pateni mevcut değil. Bunu nazikçe açıkla ve talep formunu gönder: https://forms.gle/7Cb9L3y63JEN869T8";
-  if (!state.location)
-    return 'Kullanıcıya şunu sor: "Bostanlı mı Göztepe mi?"';
-  if (state.location === "goztepe")
-    return "Kullanıcıya Göztepe formunu gönder: https://forms.gle/jyhmFVMZnvNxgSQu7";
-  if (!state.lesson_format)
-    return 'Kullanıcıya şunu sor: "Birebir mi grup dersi mi?"';
-  if (state.lesson_format === "individual")
-    return "Kullanıcıya Bostanlı birebir formunu gönder: https://forms.gle/MtYW78bTPpAQPF4r8";
-  return "Kullanıcıya Bostanlı grup formunu gönder: https://forms.gle/EbcNkzQQbAxRms8E8";
-}
-
-function buildSystemPrompt(
-  routing: RoutingResult | null,
-  history: HistoryMessage[]
-): string {
-  const state = extractConversationState(history);
-
-  // Summarise what we already know so AI never re-asks it
-  const known: string[] = [];
-  if (state.lesson_type)
-    known.push(state.lesson_type === "roller" ? "Tekerlekli paten istediğini söyledi" : "Buz pateni istediğini söyledi");
-  if (state.location)
-    known.push(state.location === "bostanli" ? "Bostanlı tercih etti" : "Göztepe tercih etti");
-  if (state.lesson_format)
-    known.push(state.lesson_format === "individual" ? "Birebir ders istediğini söyledi" : "Grup dersi istediğini söyledi");
-
-  const knownBlock =
-    known.length > 0
-      ? `\n\n## KULLANICININ DAHA ÖNCE SÖYLEDİKLERİ (bunları bir daha SORMA)\n${known.join("\n")}`
-      : "";
-
-  // Check if the current message is a price question — if so, don't inject a
-  // flow step so the price tool instruction in SYSTEM_PROMPT takes over.
-  const lastUserMsg = [...history].reverse().find((m) => m.role === "user")?.content.toLowerCase() ?? "";
-  const isPriceQuery = /fiyat|ücret|kaç\s*para|ne\s*kadar/.test(lastUserMsg);
-
-  const nextStepBlock = !isPriceQuery
-    ? `\n\n## ŞIMDI YAPMAN GEREKEN\n${getNextStep(state)}`
-    : "";
-
-  console.log(`[webhook] state: lesson=${state.lesson_type} loc=${state.location} fmt=${state.lesson_format} priceQuery=${isPriceQuery}`);
-
-  return SYSTEM_PROMPT + knownBlock + nextStepBlock;
-}
-
-// Call AI — uses routed model if available, otherwise standard fallback chain
 function callAI(messages: ChatMessage[], routing: RoutingResult | null): Promise<string> {
   if (routing) {
     return callWithModel(routing.model, routing.fallback_model, messages);
@@ -188,13 +115,19 @@ function callAI(messages: ChatMessage[], routing: RoutingResult | null): Promise
   return getAIResponse(messages);
 }
 
-// Run AI in a tool-use loop (max 4 iterations to prevent runaway)
+// Single-turn prompt → tool loop → final reply
 async function runAI(
-  messages: ChatMessage[],
+  history: HistoryMessage[],
+  currentMessage: string,
   toolContext: ToolContext,
   routing: RoutingResult | null
 ): Promise<string> {
   const MAX_ITERS = 4;
+
+  // Start with the fully-filled single-turn prompt
+  let messages: ChatMessage[] = [
+    { role: "user", content: buildPrompt(history, currentMessage) },
+  ];
 
   for (let i = 0; i < MAX_ITERS; i++) {
     const response = await callAI(messages, routing);
@@ -205,9 +138,6 @@ async function runAI(
     }
 
     console.log(`[webhook] tool call: ${extracted.action}`, extracted.parameters);
-    if (extracted.preamble) {
-      console.log(`[webhook] preamble stripped: "${extracted.preamble}"`);
-    }
 
     const toolResult = await executeTool(
       extracted.action,
@@ -215,16 +145,13 @@ async function runAI(
       toolContext
     );
 
-    const preambleNote = extracted.preamble
-      ? `[AI başlangıç metni: "${extracted.preamble}"]\n`
-      : "";
-
+    // Continue the conversation with the tool result
     messages = [
       ...messages,
       { role: "assistant", content: response },
       {
         role: "user",
-        content: `${preambleNote}[Araç sonucu: ${toolResult.tool}]\n${toolResult.result}\n\nBu bilgiyi kullanarak kullanıcıya doğal Türkçe ile yanıt ver. Kesinlikle kendi fiyat uydurma.`,
+        content: `[Fiyat bilgisi]\n${toolResult.result}\n\nBu fiyatları kullanarak kullanıcıya kısa ve doğal Türkçe ile yanıt ver. Fiyat uydurmа.`,
       },
     ];
   }
@@ -313,14 +240,6 @@ export async function POST(req: NextRequest) {
     const history =
       historyResult.status === "fulfilled" ? (historyResult.value.data ?? []) : [];
 
-    const aiMessages: ChatMessage[] = [
-      { role: "system", content: buildSystemPrompt(routing, history) },
-      ...history.map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      })),
-    ];
-
     const toolContext: ToolContext = {
       igsid: senderIgsid,
       name: profileName,
@@ -328,7 +247,7 @@ export async function POST(req: NextRequest) {
       conversationId: conversation.id,
     };
 
-    const aiReply = await runAI(aiMessages, toolContext, routing);
+    const aiReply = await runAI(history, text, toolContext, routing);
 
     const sendResult = await sendInstagramMessage(senderIgsid, aiReply);
     if (sendResult.error) {
