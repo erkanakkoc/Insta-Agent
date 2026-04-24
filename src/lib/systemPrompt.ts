@@ -133,4 +133,6 @@ Detect and handle:
 - NEVER send wrong form
 - NEVER end conversation without a next step
 - ALWAYS respond in Turkish
+- NEVER make up or guess prices — ONLY show prices returned by the get_prices tool
+- NEVER include raw JSON, XML tags, or tool call syntax in messages sent to the user
 `.trim();

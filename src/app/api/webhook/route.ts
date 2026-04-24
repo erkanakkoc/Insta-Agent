@@ -20,26 +20,70 @@ export async function GET(req: NextRequest) {
   return new NextResponse("Forbidden", { status: 403 });
 }
 
-// Parse AI response for tool calls — handles plain JSON or ```json blocks
-function parseToolCall(
-  text: string
-): { action: string; parameters: Record<string, unknown> } | null {
-  const cleaned = text
-    .trim()
+type ExtractedToolCall = {
+  action: string;
+  parameters: Record<string, unknown>;
+  preamble: string; // any text before the tool call (strip before sending to user)
+};
+
+// Robust tool call extractor — handles all AI response formats:
+//   1. Pure JSON:              {"action":"get_prices","parameters":{}}
+//   2. Markdown block:         ```json\n{"action":...}\n```
+//   3. Claude XML tags:        <function_calls>{"action":...}</function_calls>
+//   4. Mixed text + tool call: "Sure!\n<function_calls>{"action":...}</function_calls>"
+function extractToolCall(text: string): ExtractedToolCall | null {
+  // Helper: try to parse a string as a tool call JSON
+  const tryParse = (s: string) => {
+    try {
+      const p = JSON.parse(s.trim());
+      if (typeof p.action === "string") return p;
+    } catch {}
+    return null;
+  };
+
+  // Pattern 1: <function_calls>...</function_calls> (Claude XML style)
+  const xmlMatch = text.match(/<function_calls>([\s\S]*?)<\/function_calls>/i);
+  if (xmlMatch) {
+    const parsed = tryParse(xmlMatch[1]);
+    if (parsed) {
+      return {
+        action: parsed.action,
+        parameters: parsed.parameters ?? {},
+        preamble: text.slice(0, xmlMatch.index ?? 0).trim(),
+      };
+    }
+  }
+
+  // Pattern 2: entire message is JSON (strip markdown code fences first)
+  const stripped = text.trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
-
-  if (!cleaned.startsWith("{")) return null;
-
-  try {
-    const parsed = JSON.parse(cleaned);
-    if (typeof parsed.action === "string") {
-      return { action: parsed.action, parameters: parsed.parameters ?? {} };
-    }
-  } catch {
-    // Not valid JSON
+  if (stripped.startsWith("{")) {
+    const parsed = tryParse(stripped);
+    if (parsed) return { action: parsed.action, parameters: parsed.parameters ?? {}, preamble: "" };
   }
+
+  // Pattern 3: JSON embedded in text — find {"action" and balance braces
+  const startIdx = text.indexOf('{"action"');
+  if (startIdx !== -1) {
+    let depth = 0, endIdx = -1;
+    for (let i = startIdx; i < text.length; i++) {
+      if (text[i] === "{") depth++;
+      else if (text[i] === "}") { depth--; if (depth === 0) { endIdx = i; break; } }
+    }
+    if (endIdx !== -1) {
+      const parsed = tryParse(text.slice(startIdx, endIdx + 1));
+      if (parsed) {
+        return {
+          action: parsed.action,
+          parameters: parsed.parameters ?? {},
+          preamble: text.slice(0, startIdx).trim(),
+        };
+      }
+    }
+  }
+
   return null;
 }
 
@@ -79,26 +123,33 @@ async function runAI(
   for (let i = 0; i < MAX_ITERS; i++) {
     const response = await callAI(messages, routing);
 
-    const toolCall = parseToolCall(response);
-    if (!toolCall) {
-      return response; // Plain text — send to user
+    const extracted = extractToolCall(response);
+    if (!extracted) {
+      return response; // Clean text — send to user
     }
 
-    console.log(`[webhook] tool call: ${toolCall.action}`, toolCall.parameters);
+    console.log(`[webhook] tool call: ${extracted.action}`, extracted.parameters);
+    if (extracted.preamble) {
+      console.log(`[webhook] preamble stripped: "${extracted.preamble}"`);
+    }
 
     const toolResult = await executeTool(
-      toolCall.action,
-      toolCall.parameters,
+      extracted.action,
+      extracted.parameters,
       toolContext
     );
 
-    // Feed tool result back as a user turn so AI continues
+    // Feed the tool result back; note preamble so AI can incorporate it naturally
+    const preambleNote = extracted.preamble
+      ? `[AI başlangıç metni: "${extracted.preamble}"]\n`
+      : "";
+
     messages = [
       ...messages,
       { role: "assistant", content: response },
       {
         role: "user",
-        content: `[Araç sonucu: ${toolResult.tool}]\n${toolResult.result}`,
+        content: `${preambleNote}[Araç sonucu: ${toolResult.tool}]\n${toolResult.result}\n\nBu bilgiyi kullanarak kullanıcıya doğal Türkçe ile yanıt ver. Kesinlikle kendi fiyat uydurmа.`,
       },
     ];
   }

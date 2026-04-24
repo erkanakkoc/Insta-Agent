@@ -30,6 +30,22 @@ export async function executeTool(
   }
 }
 
+// Fallback prices used when GOOGLE_SHEETS_PRICES_URL is not configured
+const FALLBACK_PRICES = `
+Tekerlekli Paten Dersi Ücretleri:
+
+Bireysel Ders Paketleri:
+- Tek Ders: 1200 TL
+- Aylık 4 Ders: 4000 TL
+- Aylık 8 Ders: 7500 TL
+
+Grup Ders Paketleri:
+- Aylık 4 Ders: 2800 TL
+- Aylık 8 Ders: 5000 TL
+
+Mini Grup (2 veya daha fazla kişi kendi grubunu kurarsa): Kişi başı 800 TL
+`.trim();
+
 async function getPrices(): Promise<ToolCallResult> {
   const sheetUrl = process.env.GOOGLE_SHEETS_PRICES_URL;
 
@@ -37,7 +53,7 @@ async function getPrices(): Promise<ToolCallResult> {
     return {
       tool: "get_prices",
       success: true,
-      result: "Fiyat bilgisi şu an sistemde tanımlı değil. Kullanıcıya koçla doğrudan iletişime geçmesini söyle.",
+      result: FALLBACK_PRICES,
     };
   }
 
@@ -51,11 +67,11 @@ async function getPrices(): Promise<ToolCallResult> {
       result: `Güncel fiyat listesi:\n${text}`,
     };
   } catch (err) {
-    console.error("[tools] get_prices failed:", err);
+    console.error("[tools] get_prices failed, using fallback prices:", err);
     return {
       tool: "get_prices",
-      success: false,
-      result: "Fiyatlar şu an alınamadı. Kullanıcıya yakında bilgi verileceğini söyle.",
+      success: true,
+      result: FALLBACK_PRICES,
     };
   }
 }
