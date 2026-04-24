@@ -9,29 +9,23 @@ function getOpenAI() {
 
 function getFallbackModels(): string[] {
   return [
-    // Primary model from env (set this to a reliable paid model for production)
     process.env.AI_MODEL,
-    // Meta — separate provider, won't rate-limit together with Google
     "meta-llama/llama-3.1-8b-instruct:free",
     "meta-llama/llama-3.2-3b-instruct:free",
-    // Qwen (Alibaba) — different provider
     "qwen/qwen-2-7b-instruct:free",
-    // DeepSeek — different provider
     "deepseek/deepseek-r1-distill-qwen-7b:free",
-    // Microsoft — different provider
     "microsoft/phi-3-mini-128k-instruct:free",
-    // Google — original chain, now further down
     "google/gemma-3-12b-it:free",
     "google/gemma-3-4b-it:free",
-    // Mistral
     "mistralai/mistral-7b-instruct:free",
   ].filter(Boolean) as string[];
 }
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
-// Gemma (Google AI Studio) doesn't support the "system" role — prepend it to
-// the first user message so the prompt works across all free OpenRouter models.
+// Fallback for models that don't support the "system" role (e.g. Gemma via
+// Google AI Studio). Prepends system content into the first user message so
+// the instructions still reach the model.
 function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
   const systemContent = messages
     .filter((m) => m.role === "system")
@@ -54,29 +48,51 @@ function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
   );
 }
 
-async function tryModels(models: string[], payload: ChatMessage[]): Promise<string> {
+// Try models in order. For each model, first attempt with the original
+// messages (preserving the system role). If the model returns 400 (e.g.
+// Gemma rejecting "developer instructions"), retry once with the system
+// role stripped and prepended to the first user message instead.
+async function tryModels(models: string[], messages: ChatMessage[]): Promise<string> {
   const openai = getOpenAI();
+  const normalizedMessages = normalizeMessages(messages); // computed once
 
   for (const model of models) {
-    try {
-      const completion = await openai.chat.completions.create({ model, messages: payload });
-      console.log(`[ai] responded with model: ${model}`);
-      return completion.choices[0]?.message?.content || "Üzgünüm, şu an bir yanıt oluşturamadım.";
-    } catch (err: unknown) {
-      const status = (err as { status?: number })?.status;
-      if (status === 429 || status === 404 || status === 400) {
-        console.warn(`Model ${model} failed with ${status}, trying next...`);
-        continue;
+    let payload = messages;
+    let retriedNormalized = false;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        const completion = await openai.chat.completions.create({ model, messages: payload });
+        console.log(`[ai] responded with model: ${model}`);
+        return completion.choices[0]?.message?.content || "Üzgünüm, şu an bir yanıt oluşturamadım.";
+      } catch (err: unknown) {
+        const status = (err as { status?: number })?.status;
+
+        if (status === 400 && !retriedNormalized) {
+          // Model rejected system role — retry without it
+          console.warn(`[ai] ${model} rejected system role (400), retrying normalized...`);
+          payload = normalizedMessages;
+          retriedNormalized = true;
+          continue;
+        }
+
+        if (status === 429 || status === 404 || status === 400) {
+          console.warn(`[ai] Model ${model} failed with ${status}, trying next...`);
+          break; // move to next model
+        }
+
+        throw err; // unexpected error — propagate
       }
-      throw err;
     }
   }
+
   return "Üzgünüm, şu anda geçici olarak hizmet veremiyorum. Lütfen biraz sonra tekrar deneyin";
 }
 
 // Default fallback chain — used when no specific model is routed
 export async function getAIResponse(messages: ChatMessage[]): Promise<string> {
-  return tryModels(getFallbackModels(), normalizeMessages(messages));
+  return tryModels(getFallbackModels(), messages);
 }
 
 // Routed call — tries primaryModel first, then fallbackModel, then standard chain
@@ -88,8 +104,7 @@ export async function callWithModel(
   const chain = [
     primaryModel,
     fallbackModel,
-    // Append standard chain excluding already-listed models to avoid duplicates
     ...getFallbackModels().filter((m) => m !== primaryModel && m !== fallbackModel),
   ];
-  return tryModels(chain, normalizeMessages(messages));
+  return tryModels(chain, messages);
 }
