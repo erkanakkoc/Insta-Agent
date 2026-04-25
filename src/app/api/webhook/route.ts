@@ -108,22 +108,22 @@ async function processInBackground(
     return;
   }
 
-  // 4. Fetch recent history + refresh profile in parallel
-  //    Profile refresh is best-effort and does not block AI
-  const [historyResult] = await Promise.allSettled([
-    db
-      .from("instagram_messages")
-      .select("role, content")
-      .eq("conversation_id", conversation.id)
-      .order("created_at", { ascending: true })
-      .limit(10), // tight limit — keeps AI prompt short and fast
-  ]);
+  // 4. Fetch recent history (single await — no need for allSettled wrapper)
+  const { data: historyData } = await db
+    .from("instagram_messages")
+    .select("role, content")
+    .eq("conversation_id", conversation.id)
+    .order("created_at", { ascending: true })
+    .limit(10);
 
-  // Profile refresh runs fully async — cached name/username used for this req
-  refreshProfile(db, senderIgsid).catch(() => {});
+  const history: HistoryRow[] = historyData ?? [];
 
-  const history: HistoryRow[] =
-    historyResult.status === "fulfilled" ? (historyResult.value.data ?? []) : [];
+  // Refresh profile only when we don't have it yet — avoids an Instagram API
+  // call on every message. Cached name/username is used for this request.
+  const conv = conversation as { name?: string | null; username?: string | null };
+  if (!conv.name && !conv.username) {
+    refreshProfile(db, senderIgsid).catch(() => {});
+  }
 
   const toolContext: ToolContext = {
     igsid: senderIgsid,

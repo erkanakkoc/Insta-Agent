@@ -32,61 +32,28 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// Models that reject the "system" role (e.g. some Gemma variants) get the
-// system content prepended to the first user message instead.
-function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
-  const systemContent = messages
-    .filter((m) => m.role === "system")
-    .map((m) => m.content)
-    .join("\n\n");
-
-  const rest = messages.filter((m) => m.role !== "system");
-  if (!systemContent) return rest;
-
-  const firstUserIdx = rest.findIndex((m) => m.role === "user");
-  if (firstUserIdx === -1) return [{ role: "user", content: systemContent }, ...rest];
-
-  return rest.map((m, i) =>
-    i === firstUserIdx ? { ...m, content: `${systemContent}\n\n${m.content}` } : m
-  );
-}
-
 async function tryModels(models: string[], messages: ChatMessage[]): Promise<string> {
   const openai = getOpenAI();
-  const normalizedMessages = normalizeMessages(messages); // computed once
 
   for (const model of models) {
-    let payload = messages;
-    let retriedNormalized = false;
+    try {
+      const completion = await withTimeout(
+        openai.chat.completions.create({ model, messages }),
+        MODEL_TIMEOUT_MS
+      );
+      console.log(`[ai] model: ${model}`);
+      return completion.choices[0]?.message?.content ?? "Üzgünüm, şu an bir yanıt oluşturamadım.";
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      const msg = (err as Error)?.message ?? "";
+      const isTimeout = msg.startsWith("model_timeout");
 
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      try {
-        const completion = await withTimeout(
-          openai.chat.completions.create({ model, messages: payload }),
-          MODEL_TIMEOUT_MS
-        );
-        console.log(`[ai] model: ${model}`);
-        return completion.choices[0]?.message?.content ?? "Üzgünüm, şu an bir yanıt oluşturamadım.";
-      } catch (err: unknown) {
-        const status = (err as { status?: number })?.status;
-        const msg = (err as Error)?.message ?? "";
-        const isTimeout = msg.startsWith("model_timeout");
-
-        if (status === 400 && !retriedNormalized) {
-          // Model rejected system role — retry once without it
-          payload = normalizedMessages;
-          retriedNormalized = true;
-          continue;
-        }
-
-        if (isTimeout || status === 429 || status === 404 || status === 400) {
-          console.warn(`[ai] ${model} skipped (${isTimeout ? "timeout" : status})`);
-          break; // try next model
-        }
-
-        throw err; // unexpected — propagate
+      if (isTimeout || status === 429 || status === 404 || status === 400) {
+        console.warn(`[ai] ${model} skipped (${isTimeout ? "timeout" : status})`);
+        continue;
       }
+
+      throw err;
     }
   }
 
@@ -95,18 +62,4 @@ async function tryModels(models: string[], messages: ChatMessage[]): Promise<str
 
 export async function getAIResponse(messages: ChatMessage[]): Promise<string> {
   return tryModels(getFallbackModels(), messages);
-}
-
-// Used by router or any caller that wants a specific primary model
-export async function callWithModel(
-  primaryModel: string,
-  fallbackModel: string,
-  messages: ChatMessage[]
-): Promise<string> {
-  const chain = [
-    primaryModel,
-    fallbackModel,
-    ...getFallbackModels().filter((m) => m !== primaryModel && m !== fallbackModel),
-  ].slice(0, 3);
-  return tryModels(chain, messages);
 }
